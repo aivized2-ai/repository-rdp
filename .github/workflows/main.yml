@@ -1,6 +1,6 @@
-name: 'win 11'
+name: "win 11"
 
-on:
+'on':
   workflow_dispatch:
 
 jobs:
