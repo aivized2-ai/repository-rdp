@@ -1,13 +1,177 @@
 
-name: "win 11"
+name: Windows RDP Setup
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
-    runs-on: windows-2022
+  secure-rdp:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+
     steps:
-      - name: Test workflow
+      - name: Configure Remote Desktop
         shell: pwsh
-        run: Write-Host "Workflow YAML is valid"
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          # Require TLS security layer
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 2
+
+          # Start Remote Desktop service
+          Set-Service -Name TermService -StartupType Automatic
+
+          Start-Service -Name TermService
+
+          Write-Host "Remote Desktop configured successfully."
+
+      - name: Configure RDP Firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Find Tailscale network interface
+          $adapter = Get-NetAdapter |
+            Where-Object {
+              $_.InterfaceDescription -match "Tailscale"
+            } |
+            Select-Object -First 1
+
+          if (-not $adapter) {
+            throw "Tailscale network adapter not found."
+          }
+
+          # Remove previous custom rule
+          Get-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          # Allow RDP only through Tailscale
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -InterfaceAlias $adapter.Name `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Write-Host "Tailscale-only RDP firewall rule created."
+
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($username) -or
+              [string]::IsNullOrWhiteSpace($password)) {
+            throw "RDP credentials are missing from GitHub Secrets."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          $user = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if (-not $user) {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -Description "Dedicated Remote Desktop User" `
+              -AccountNeverExpires
+          }
+          else {
+            Set-LocalUser `
+              -Name $username `
+              -Password $securePassword
+          }
+
+          # Enable the account
+          Enable-LocalUser -Name $username
+
+          # Add user to Remote Desktop Users if not already a member
+          $members = Get-LocalGroupMember `
+            -Group "Remote Desktop Users"
+
+          if (-not ($members.Name -match "\\$([regex]::Escape($username))$")) {
+            Add-LocalGroupMember `
+              -Group "Remote Desktop Users" `
+              -Member $username
+          }
+
+          Write-Host "RDP user configured successfully."
+
+      - name: Verify RDP Configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Verify Remote Desktop is enabled
+          $rdpEnabled = (
+            Get-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          ).fDenyTSConnections -eq 0
+
+          if (-not $rdpEnabled) {
+            throw "Remote Desktop is not enabled."
+          }
+
+          # Verify NLA
+          $nla = (
+            Get-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          ).UserAuthentication -eq 1
+
+          if (-not $nla) {
+            throw "Network Level Authentication is disabled."
+          }
+
+          # Verify RDP service
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+            throw "Remote Desktop service is not running."
+          }
+
+          # Verify local TCP listener
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            throw "RDP is not listening on TCP port 3389."
+          }
+
+          Write-Host "RDP configuration verified successfully."
+
+          Write-Host "RDP Status: Enabled"
+          Write-Host "NLA: Enabled"
+          Write-Host "RDP Service: Running"
+          Write-Host "TCP Port: 3389"
+          Write-Host "Access: Tailscale network only"
